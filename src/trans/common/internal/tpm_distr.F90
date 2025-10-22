@@ -79,7 +79,7 @@ INTEGER(KIND=JPIM) ,ALLOCATABLE :: NALLMS(:) ! Wave numbers for all a-set concat
                                 ! have to be gathered.
 INTEGER(KIND=JPIM) ,ALLOCATABLE :: NPTRMS(:) ! Pointer to the first wave number of a given
                                 ! a-set in nallms array.
-
+INTEGER(KIND=JPIM), ALLOCATABLE :: NIGLLS(:) ! Global latitude index for each local grid-point
 
 ! Legendre polynomials
 

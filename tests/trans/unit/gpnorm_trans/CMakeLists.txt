@@ -13,6 +13,7 @@ set( test_list
   unit_test_gpnorm_trans_min
   unit_test_gpnorm_trans_max
   unit_test_gpnorm_trans_ave
+  unit_test_gpnorm_trans_compare
 )
 
 # Declare tests that WILL_FAIL

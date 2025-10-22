@@ -243,6 +243,157 @@ INTEGER FUNCTION UNIT_TEST_GPNORM_TRANS_AVE() RESULT(RET) BIND(C)
   CALL CLEANUP_TEST(LUSE_MPI)
 END FUNCTION UNIT_TEST_GPNORM_TRANS_AVE
 
+
+INTEGER FUNCTION UNIT_TEST_GPNORM_TRANS_COMPARE() RESULT(RET) BIND(C)
+
+  REAL(KIND=JPRB), ALLOCATABLE :: ZGP(:,:,:), ZGPG(:,:)
+  REAL(KIND=JPRB) :: AVE_A(1), MIN_A(1), MAX_A(1)
+  REAL(KIND=JPRB) :: AVE_B(1), MIN_B(1), MAX_B(1)
+  INTEGER(KIND=JPIM) :: NSPEC2, NGPTOTG, NGPTOT, MY_PROC, NGPBLKS
+  LOGICAL :: LUSE_MPI
+  INTEGER(KIND=JPIM) :: ILOEN(NDGL)
+  INTEGER(KIND=JPIM) :: I, J, K
+  INTEGER :: FAILS
+  REAL(KIND=JPRB), PARAMETER :: REL_TOL = 1.0e-6_JPRB
+  REAL(KIND=JPRB), PARAMETER :: ABS_TOL = 1.0e2_JPRB * EPSILON(1.0_JPRB)
+
+  INTERFACE
+    SUBROUTINE GPNORM_TRANS(PGP,KFIELDS,KPROMA,PAVE,PMIN,PMAX,LDAVE_ONLY,KRESOL,USE_LGP)
+      USE PARKIND1, ONLY: JPIM, JPRB
+      REAL(KIND=JPRB)   ,INTENT(IN)    :: PGP(:,:,:)
+      REAL(KIND=JPRB)   ,INTENT(OUT)   :: PAVE(:)
+      REAL(KIND=JPRB)   ,INTENT(INOUT) :: PMIN(:)
+      REAL(KIND=JPRB)   ,INTENT(INOUT) :: PMAX(:)
+      INTEGER(KIND=JPIM),INTENT(IN)    :: KFIELDS
+      INTEGER(KIND=JPIM),INTENT(IN)    :: KPROMA
+      LOGICAL           ,INTENT(IN)    :: LDAVE_ONLY
+      INTEGER(KIND=JPIM),INTENT(IN), OPTIONAL :: KRESOL
+      LOGICAL           ,INTENT(IN), OPTIONAL :: USE_LGP
+    END SUBROUTINE GPNORM_TRANS
+  END INTERFACE
+
+  ! ----------------- Test body -----------------
+  CALL SETUP_TEST(NSPEC2, NGPTOTG, NGPTOT, NGPBLKS, LUSE_MPI, MY_PROC)
+
+  DO I = 1, TRUNCATION + 1
+    ILOEN(I) = 20 + 4 * I
+    ILOEN(NDGL - I + 1) = ILOEN(I)
+  END DO
+
+  FAILS = 0
+
+  ! Case 1: delta
+  IF (MY_PROC == 1) THEN
+    ALLOCATE(ZGPG(NGPTOTG,1)); ZGPG = 0.0_JPRB; ZGPG(1,1) = 1.0_JPRB
+  END IF
+  ALLOCATE(ZGP(NPROMA,1,NGPBLKS))
+  IF (MY_PROC == 1) THEN
+    CALL DIST_GRID(PGPG=ZGPG, KFDISTG=1, KFROM=(/1/), PGP=ZGP, KPROMA=NPROMA)
+  ELSE
+    CALL DIST_GRID(KFDISTG=1, KFROM=(/1/), PGP=ZGP, KPROMA=NPROMA)
+  END IF
+  IF (MY_PROC == 1) DEALLOCATE(ZGPG)
+  CALL DO_COMPARE('delta ave/min/max', LDAVE=.FALSE.)
+  DEALLOCATE(ZGP)
+
+  ! Case 2: ones
+  ALLOCATE(ZGP(NPROMA,1,NGPBLKS)); ZGP = 1.0_JPRB
+  CALL DO_COMPARE('ones ave/min/max', LDAVE=.FALSE.)
+  DEALLOCATE(ZGP)
+
+  ! Case 3: PW-sensitive row-constant
+  IF (MY_PROC == 1) THEN
+    ALLOCATE(ZGPG(NGPTOTG,1)); ZGPG = 0.0_JPRB
+    K = 1
+    DO I = 1, NDGL
+      DO J = 1, ILOEN(I)
+        ZGPG(K,1) = REAL(I, JPRB)
+        K = K + 1
+      END DO
+    END DO
+  END IF
+  ALLOCATE(ZGP(NPROMA,1,NGPBLKS))
+  IF (MY_PROC == 1) THEN
+    CALL DIST_GRID(PGPG=ZGPG, KFDISTG=1, KFROM=(/1/), PGP=ZGP, KPROMA=NPROMA)
+  ELSE
+    CALL DIST_GRID(KFDISTG=1, KFROM=(/1/), PGP=ZGP, KPROMA=NPROMA)
+  END IF
+  IF (MY_PROC == 1) DEALLOCATE(ZGPG)
+
+  ! 3a) Average-only path (exercise ave-only branch)
+  CALL DO_COMPARE('row-const ave only', LDAVE=.TRUE.)
+  ! 3b) Full path (also checks min/max)
+  CALL DO_COMPARE('row-const ave+minmax', LDAVE=.FALSE.)
+  DEALLOCATE(ZGP)
+
+  CALL CLEANUP_TEST(LUSE_MPI)
+  RET = MERGE(0, 1, FAILS == 0)
+CONTAINS
+  PURE LOGICAL FUNCTION OK_EQ(X, Y) RESULT(OK)
+    REAL(KIND=JPRB), INTENT(IN) :: X, Y
+    REAL(KIND=JPRB) :: REL
+    REL = ABS(X - Y) / MAX(1.0_JPRB, ABS(X), ABS(Y))
+    OK = (ABS(X - Y) <= ABS_TOL) .OR. (REL <= REL_TOL)
+  END FUNCTION OK_EQ
+
+  SUBROUTINE DO_COMPARE(TAG, LDAVE)
+    CHARACTER(*), INTENT(IN) :: TAG
+    LOGICAL,      INTENT(IN) :: LDAVE
+    INTEGER :: LOC_FAIL
+    REAL(KIND=JPRB) :: DAVE, DMIN, DMAX, RELAVE, RELMIN, RELMAX
+
+    LOC_FAIL = 0
+
+    CALL GPNORM_TRANS(ZGP, 1, NPROMA, AVE_A, MIN_A, MAX_A, LDAVE, USE_LGP=.FALSE.)
+    CALL GPNORM_TRANS(ZGP, 1, NPROMA, AVE_B, MIN_B, MAX_B, LDAVE, USE_LGP=.TRUE.)
+
+    IF (MY_PROC == 1) THEN
+    DAVE = AVE_A(1) - AVE_B(1)
+    RELAVE = ABS(DAVE) / MAX(1.0_JPRB, ABS(AVE_A(1)), ABS(AVE_B(1)))
+
+    IF (.NOT. OK_EQ(AVE_A(1), AVE_B(1))) LOC_FAIL = 1
+      IF (.NOT. LDAVE) THEN
+        DMIN = MIN_A(1) - MIN_B(1)
+        DMAX = MAX_A(1) - MAX_B(1)
+        RELMIN = ABS(DMIN) / MAX(1.0_JPRB, ABS(MIN_A(1)), ABS(MIN_B(1)))
+        RELMAX = ABS(DMAX) / MAX(1.0_JPRB, ABS(MAX_A(1)), ABS(MAX_B(1)))
+        IF (.NOT. OK_EQ(MIN_A(1), MIN_B(1))) LOC_FAIL = 1
+        IF (.NOT. OK_EQ(MAX_A(1), MAX_B(1))) LOC_FAIL = 1
+      ELSE
+        DMIN = 0.0_JPRB; DMAX = 0.0_JPRB
+        RELMIN = 0.0_JPRB; RELMAX = 0.0_JPRB
+      END IF
+
+        WRITE(*,'(A)') ''
+        WRITE(*,'(A)') '--- ' // TRIM(TAG) // ' ---'
+        WRITE(*,'(A,L1)') ' LDAVE_ONLY = ', LDAVE
+        WRITE(*,'(A,1PE16.8)') ' A_avg : ', AVE_A(1)
+        WRITE(*,'(A,1PE16.8)') ' B_avg : ', AVE_B(1)
+        WRITE(*,'(A,1PE16.8,2X,A,1PE10.3)') ' Delta avg : ', DAVE, ' rel=', RELAVE
+
+        IF (.NOT. LDAVE) THEN
+          WRITE(*,'(A,1PE16.8)') ' A_min : ', MIN_A(1)
+          WRITE(*,'(A,1PE16.8)') ' B_min : ', MIN_B(1)
+          WRITE(*,'(A,1PE16.8,2X,A,1PE10.3)') ' Delta min : ', DMIN, ' rel=', RELMIN
+          WRITE(*,'(A,1PE16.8)') ' A_max : ', MAX_A(1)
+          WRITE(*,'(A,1PE16.8)') ' B_max : ', MAX_B(1)
+          WRITE(*,'(A,1PE16.8,2X,A,1PE10.3)') ' Delta max : ', DMAX, ' rel=', RELMAX
+        END IF
+
+        IF (LOC_FAIL /= 0) THEN
+          WRITE(*,'(A)') ' WARNING: difference exceeds tolerance.'
+        ELSE
+          WRITE(*,'(A)') ' OK: results within tolerance.'
+        END IF
+    END IF
+
+    IF (LUSE_MPI) CALL MPL_ALLREDUCE(LOC_FAIL, CDOPER="MAX")
+    FAILS = FAILS + LOC_FAIL
+  END SUBROUTINE DO_COMPARE
+END FUNCTION UNIT_TEST_GPNORM_TRANS_COMPARE
+
+!---------------------------------------------------------------------------------------------------
+
 !---------------------------------------------------------------------------------------------------
 
 END MODULE GPNORM_TRANS_TEST_SUITE

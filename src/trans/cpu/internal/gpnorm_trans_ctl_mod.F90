@@ -452,4 +452,214 @@ IF (LHOOK) CALL DR_HOOK('GPNORM_TRANS_CTL',1,ZHOOK_HANDLE)
 
 
 END SUBROUTINE GPNORM_TRANS_CTL
+
+SUBROUTINE GPNORM_TRANS_CTL_LGP(PGP,KFIELDS,KPROMA,PAVE,PMIN,PMAX,LDAVE_ONLY,PW)
+
+
+!**** *GPNORM_TRANS_CTL* - calculate grid-point norms
+
+!     Purpose.
+!     --------
+!        calculate grid-point norms using local accumulation by latitude slices
+
+!**   Interface.
+!     ----------
+!     CALL GPNORM_TRANS_CTL(...)
+
+!     Explicit arguments :
+!     --------------------
+!     PGP(:,:,:) - gridpoint fields (input)
+!                  PGP is  dimensioned (NPROMA,KFIELDS,NGPBLKS) where
+!                  NPROMA is the blocking factor, KFIELDS the total number
+!                  of fields and NGPBLKS the number of NPROMA blocks.
+!     KFIELDS     - number of fields (input)
+!                   (these do not have to be just levels)
+!     KPROMA      - required blocking factor (input)
+!     PAVE        - average (output)
+!     PMIN        - minimum (input/output)
+!     PMAX        - maximum (input/output)
+!     LDAVE_ONLY  - T : PMIN and PMAX already contain local MIN and MAX
+!
+
+!     Author.
+!     -------
+!        George Mozdzynski *ECMWF*
+
+!     Modifications.
+!     --------------
+!        Original : 19th Sept 2008
+!        R. El Khatib 07-08-2009 Optimisation directive for NEC
+!        R. El Khatib 16-Sep-2019 merge with LAM code
+!        R. El Khatib 02-Jun-2022 Optimization/Cleaning
+!        F. Vana      14-Nov-2024 bug fix in W gather
+!     ------------------------------------------------------------------
+
+  USE PARKIND1         , ONLY : JPIM, JPRB, JPRD
+  USE TPM_GEN          , ONLY : NOUT
+  USE TPM_TRANS       ,  ONLY : NGPBLKS, NPROMA
+  USE TPM_DIM          , ONLY : R                ! R%NDGL
+  USE TPM_GEOMETRY     , ONLY : G                ! G%NLOEN(:)
+  USE TPM_DISTR        , ONLY : D, NPRCIDS, MYPROC, NPROC   ! GP decomposition + rank ids
+  USE EQ_REGIONS_MOD   , ONLY : MY_REGION_NS, MY_REGION_EW  ! our NS/EW region indices
+  USE MPL_MODULE       , ONLY : MPL_RECV, MPL_SEND, JP_BLOCKING_STANDARD
+  USE ABORT_TRANS_MOD  , ONLY : ABORT_TRANS
+  USE YOMHOOK          , ONLY : LHOOK, DR_HOOK, JPHOOK
+  
+
+  IMPLICIT NONE
+
+  ! Arguments
+  REAL(KIND=JPRB)   , INTENT(IN)    :: PGP(:,:,:)
+  INTEGER(KIND=JPIM), INTENT(IN)    :: KFIELDS, KPROMA
+  REAL(KIND=JPRB)   , INTENT(OUT)   :: PAVE(:)
+  REAL(KIND=JPRB)   , INTENT(INOUT) :: PMIN(:), PMAX(:)
+  LOGICAL           , INTENT(IN)    :: LDAVE_ONLY
+  REAL(KIND=JPRD)   , INTENT(IN)    :: PW(R%NDGL)
+
+  ! Locals
+  REAL(KIND=JPHOOK)              :: ZHOOK_HANDLE
+  INTEGER(KIND=JPIM)             :: IUB(3)
+  INTEGER(KIND=JPIM)             :: JLOC, IGLAT, IBSET, ISTA_LOC, NPTS, ILOC
+  INTEGER(KIND=JPIM)             :: IGP, JBLK, JI, JF,IGL,ICEND
+  INTEGER(KIND=JPIM)             :: ITAG, ILEN, ILENR, IND, IRANK, IPTR
+  REAL(KIND=JPRD)                :: W
+  REAL(KIND=JPRD), ALLOCATABLE   :: ZSUM(:)     ! weighted sums (global-mean contributions)
+  REAL(KIND=JPRD), ALLOCATABLE   :: ZSND(:), ZRCV(:)
+  REAL(KIND=JPRB), ALLOCATABLE   :: ZMING(:), ZMAXG(:)
+  REAL(KIND=JPRD), ALLOCATABLE :: WLAT(:)
+ 
+
+
+  !Precompute weight per lat
+  ALLOCATE(WLAT(R%NDGL))
+  WLAT(:) = PW(:) / G%NLOEN(:)
+
+  IF (LHOOK) CALL DR_HOOK('GPNORM_TRANS_CTL',0,ZHOOK_HANDLE)
+
+  NPROMA = KPROMA
+  NGPBLKS = (D%NGPTOT-1)/NPROMA+1
+
+  IUB(1:3) = UBOUND(PGP)
+  IF (IUB(1) < KPROMA) THEN
+    WRITE(NOUT,*) 'GPNORM_TRANS_CTL: first dim of PGP too small ', IUB(1), KPROMA
+    CALL ABORT_TRANS('GPNORM_TRANS_CTL: first dim too small')
+  END IF
+  IF (IUB(2) < KFIELDS) THEN
+    WRITE(NOUT,*) 'GPNORM_TRANS_CTL: second dim of PGP too small ', IUB(2), KFIELDS
+    CALL ABORT_TRANS('GPNORM_TRANS_CTL: second dim too small')
+  END IF
+  IF (IUB(3) < NGPBLKS) THEN
+    WRITE(NOUT,*) 'GPNORM_TRANS_CTL: third dim of PGP too small ', IUB(3), NGPBLKS
+    CALL ABORT_TRANS('GPNORM_TRANS_CTL: third dim too small')
+  END IF
+
+  ! --- Local accumulators (per field)
+  ALLOCATE(ZSUM(KFIELDS));  ZSUM(:)  = 0.0_JPRD
+  ALLOCATE(ZMING(KFIELDS)); ZMING(:) = HUGE(ZMING(1))
+  ALLOCATE(ZMAXG(KFIELDS)); ZMAXG(:) = -HUGE(ZMAXG(1))
+  
+  ! If caller already provided local min/max (LDAVE_ONLY), honour them
+  IF (LDAVE_ONLY) THEN
+    ZMING(:) = PMIN(:)
+    ZMAXG(:) = PMAX(:)
+  END IF
+  
+  DO JBLK = 1, NGPBLKS
+    ICEND = MIN(NPROMA, D%NGPTOT - (JBLK-1)*NPROMA)
+    DO JI = 1, ICEND
+      IGP  = (JBLK-1)*NPROMA + JI                      ! 1..D%NGPTOT (local)
+      IGL  = D%NIGLLS(IGP)                              ! 1..R%NDGL (global latitude)
+      W    = WLAT(IGL)
+  
+      DO JF = 1, KFIELDS
+        ZSUM(JF) = ZSUM(JF) + W * PGP(JI,JF,JBLK)
+        IF (.NOT. LDAVE_ONLY) THEN
+          ZMING(JF) = MIN(ZMING(JF), PGP(JI,JF,JBLK))
+          ZMAXG(JF) = MAX(ZMAXG(JF), PGP(JI,JF,JBLK))
+        END IF
+      END DO
+    END DO
+  END DO
+
+
+  ! --- Single final reduction to rank 1 (blocking, deterministic)
+  ITAG = 123
+  
+  ! determine payload length for this call
+IF (LDAVE_ONLY) THEN
+  ILEN = KFIELDS
+ELSE
+  ILEN = 3*KFIELDS
+END IF
+
+IF (NPROC > 1) THEN
+  IF (MYPROC == 1) THEN
+    ! Root: receive from ranks 2..NPROC and merge
+    ALLOCATE(ZRCV(ILEN))
+
+    DO IRANK = 2, NPROC
+      CALL MPL_RECV(ZRCV, KSOURCE=NPRCIDS(IRANK), KTAG=ITAG, &
+     &              KMP_TYPE=JP_BLOCKING_STANDARD, KOUNT=ILENR, &
+     &              CDSTRING='GPNORM_TRANS_CTL:FINAL')
+
+      IF (ILENR /= ILEN) CALL ABORT_TRANS('GPNORM_TRANS_CTL: bad payload length')
+
+      IF (LDAVE_ONLY) THEN
+        DO JF = 1, KFIELDS
+          ZSUM(JF) = ZSUM(JF) + ZRCV(JF)
+        END DO
+      ELSE
+        IND = 0
+        DO JF = 1, KFIELDS
+          IND = IND + 1; ZSUM(JF)  = ZSUM(JF)  + ZRCV(IND)
+          IND = IND + 1; ZMING(JF) = MIN(ZMING(JF), ZRCV(IND))
+          IND = IND + 1; ZMAXG(JF) = MAX(ZMAXG(JF), ZRCV(IND))
+        END DO
+      END IF
+    END DO
+
+    DEALLOCATE(ZRCV)
+
+  ELSE
+    ! Non-root: pack and send
+    IF (LDAVE_ONLY) THEN
+      ALLOCATE(ZSND(KFIELDS))
+      DO JF = 1, KFIELDS
+        ZSND(JF) = ZSUM(JF)
+      END DO
+    ELSE
+      ALLOCATE(ZSND(3*KFIELDS))
+      IND = 0
+      DO JF = 1, KFIELDS
+        IND = IND + 1; ZSND(IND) = ZSUM(JF)
+        IND = IND + 1; ZSND(IND) = ZMING(JF)
+        IND = IND + 1; ZSND(IND) = ZMAXG(JF)
+      END DO
+    END IF
+
+    CALL MPL_SEND(ZSND, KDEST=NPRCIDS(1), KTAG=ITAG, &
+   &              KMP_TYPE=JP_BLOCKING_STANDARD, CDSTRING='GPNORM_TRANS_CTL:FINAL')
+
+    DEALLOCATE(ZSND)
+  END IF
+END IF
+
+
+  ! --- Final outputs (root or serial case)
+  IF (NPROC == 1 .OR. MYPROC == 1) THEN
+    PAVE(:) = REAL(ZSUM(:), KIND=JPRB)
+    PMIN(:) = ZMING(:)
+    PMAX(:) = ZMAXG(:)
+  END IF
+
+  ! Tidy up
+  DEALLOCATE(ZSUM)
+  DEALLOCATE(ZMING)
+  DEALLOCATE(ZMAXG)
+  DEALLOCATE(WLAT)
+
+  IF (LHOOK) CALL DR_HOOK('GPNORM_TRANS_CTL',1,ZHOOK_HANDLE)
+
+  END SUBROUTINE GPNORM_TRANS_CTL_LGP
+
 END MODULE GPNORM_TRANS_CTL_MOD
