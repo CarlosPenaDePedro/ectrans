@@ -501,7 +501,7 @@ SUBROUTINE GPNORM_TRANS_CTL_LGP(PGP,KFIELDS,KPROMA,PAVE,PMIN,PMAX,LDAVE_ONLY,PW)
   USE TPM_GEOMETRY     , ONLY : G                ! G%NLOEN(:)
   USE TPM_DISTR        , ONLY : D, NPRCIDS, MYPROC, NPROC   ! GP decomposition + rank ids
   USE EQ_REGIONS_MOD   , ONLY : MY_REGION_NS, MY_REGION_EW  ! our NS/EW region indices
-  USE MPL_MODULE       , ONLY : MPL_RECV, MPL_SEND, JP_BLOCKING_STANDARD
+  USE MPL_MODULE       , ONLY : MPL_GATHERV
   USE ABORT_TRANS_MOD  , ONLY : ABORT_TRANS
   USE YOMHOOK          , ONLY : LHOOK, DR_HOOK, JPHOOK
   
@@ -519,20 +519,22 @@ SUBROUTINE GPNORM_TRANS_CTL_LGP(PGP,KFIELDS,KPROMA,PAVE,PMIN,PMAX,LDAVE_ONLY,PW)
   ! Locals
   REAL(KIND=JPHOOK)              :: ZHOOK_HANDLE
   INTEGER(KIND=JPIM)             :: IUB(3)
-  INTEGER(KIND=JPIM)             :: JLOC, IGLAT, IBSET, ISTA_LOC, NPTS, ILOC
-  INTEGER(KIND=JPIM)             :: IGP, JBLK, JI, JF,IGL,ICEND
-  INTEGER(KIND=JPIM)             :: ITAG, ILEN, ILENR, IND, IRANK, IPTR
-  REAL(KIND=JPRD)                :: W
+  INTEGER(KIND=JPIM)             :: DISP
+  INTEGER(KIND=JPIM)             :: IGP, JBLK, JI, JF,ICEND
+  INTEGER(KIND=JPIM)             :: ILEN, IND, IRANK
+  INTEGER(KIND=JPIM), ALLOCATABLE :: ZCOMCNT(:)
+  REAL(KIND=JPRD)                :: ZTMIN, ZTMAX, ZS
   REAL(KIND=JPRD), ALLOCATABLE   :: ZSUM(:)     ! weighted sums (global-mean contributions)
   REAL(KIND=JPRD), ALLOCATABLE   :: ZSND(:), ZRCV(:)
-  REAL(KIND=JPRB), ALLOCATABLE   :: ZMING(:), ZMAXG(:)
-  REAL(KIND=JPRD), ALLOCATABLE :: WLAT(:)
+  REAL(KIND=JPRD), ALLOCATABLE   :: ZMING(:), ZMAXG(:)
+  REAL(KIND=JPRD), ALLOCATABLE :: ZWLAT(:),ZWBLK(:)
  
 
-
-  !Precompute weight per lat
-  ALLOCATE(WLAT(R%NDGL))
-  WLAT(:) = PW(:) / G%NLOEN(:)
+  
+  ALLOCATE(ZWBLK(NPROMA))
+  !Precompute weight per lat (Could be precomputed once per execution only)
+  ALLOCATE(ZWLAT(R%NDGL))
+  ZWLAT(:) = PW(:) / G%NLOEN(:)
 
   IF (LHOOK) CALL DR_HOOK('GPNORM_TRANS_CTL',0,ZHOOK_HANDLE)
 
@@ -558,77 +560,71 @@ SUBROUTINE GPNORM_TRANS_CTL_LGP(PGP,KFIELDS,KPROMA,PAVE,PMIN,PMAX,LDAVE_ONLY,PW)
   ALLOCATE(ZMING(KFIELDS)); ZMING(:) = HUGE(ZMING(1))
   ALLOCATE(ZMAXG(KFIELDS)); ZMAXG(:) = -HUGE(ZMAXG(1))
   
-  ! If caller already provided local min/max (LDAVE_ONLY), honour them
+  ! If only average is needed
   IF (LDAVE_ONLY) THEN
     ZMING(:) = PMIN(:)
     ZMAXG(:) = PMAX(:)
-  END IF
+     ! Determine payload length for MPI
+    ILEN = KFIELDS
   
-  DO JBLK = 1, NGPBLKS
-    ICEND = MIN(NPROMA, D%NGPTOT - (JBLK-1)*NPROMA)
-    DO JI = 1, ICEND
-      IGP  = (JBLK-1)*NPROMA + JI                      ! 1..D%NGPTOT (local)
-      IGL  = D%NIGLLS(IGP)                              ! 1..R%NDGL (global latitude)
-      W    = WLAT(IGL)
-  
+    DO JBLK = 1, NGPBLKS
+      ICEND = MIN(NPROMA, D%NGPTOT - (JBLK-1)*NPROMA)
+
+      DO JI = 1, ICEND
+        IGP      = (JBLK-1)*NPROMA + JI
+        ZWBLK(JI) = ZWLAT( D%NIGLLS(IGP) )
+      END DO
+
       DO JF = 1, KFIELDS
-        ZSUM(JF) = ZSUM(JF) + W * PGP(JI,JF,JBLK)
-        IF (.NOT. LDAVE_ONLY) THEN
-          ZMING(JF) = MIN(ZMING(JF), PGP(JI,JF,JBLK))
-          ZMAXG(JF) = MAX(ZMAXG(JF), PGP(JI,JF,JBLK))
-        END IF
+        ZS    = 0.0_JPRD
+        DO JI = 1, ICEND
+          ZS    = ZS + ZWBLK(JI) * PGP(JI,JF,JBLK)
+        END DO
+        ZSUM(JF)  = ZSUM(JF)  + ZS
       END DO
     END DO
-  END DO
-
-
-  ! --- Single final reduction to rank 1 (blocking, deterministic)
-  ITAG = 123
-  
-  ! determine payload length for this call
-IF (LDAVE_ONLY) THEN
-  ILEN = KFIELDS
-ELSE
-  ILEN = 3*KFIELDS
-END IF
-
-IF (NPROC > 1) THEN
-  IF (MYPROC == 1) THEN
-    ! Root: receive from ranks 2..NPROC and merge
-    ALLOCATE(ZRCV(ILEN))
-
-    DO IRANK = 2, NPROC
-      CALL MPL_RECV(ZRCV, KSOURCE=NPRCIDS(IRANK), KTAG=ITAG, &
-     &              KMP_TYPE=JP_BLOCKING_STANDARD, KOUNT=ILENR, &
-     &              CDSTRING='GPNORM_TRANS_CTL:FINAL')
-
-      IF (ILENR /= ILEN) CALL ABORT_TRANS('GPNORM_TRANS_CTL: bad payload length')
-
-      IF (LDAVE_ONLY) THEN
-        DO JF = 1, KFIELDS
-          ZSUM(JF) = ZSUM(JF) + ZRCV(JF)
-        END DO
-      ELSE
-        IND = 0
-        DO JF = 1, KFIELDS
-          IND = IND + 1; ZSUM(JF)  = ZSUM(JF)  + ZRCV(IND)
-          IND = IND + 1; ZMING(JF) = MIN(ZMING(JF), ZRCV(IND))
-          IND = IND + 1; ZMAXG(JF) = MAX(ZMAXG(JF), ZRCV(IND))
-        END DO
-      END IF
-    END DO
-
-    DEALLOCATE(ZRCV)
-
+    
+  !If average and extrema is needed
   ELSE
-    ! Non-root: pack and send
+    ! Determine payload length for MPI
+    ILEN = 3*KFIELDS
+
+    DO JBLK = 1, NGPBLKS
+      ICEND = MIN(NPROMA, D%NGPTOT - (JBLK-1)*NPROMA)
+
+      DO JI = 1, ICEND
+        IGP      = (JBLK-1)*NPROMA + JI
+        ZWBLK(JI) = ZWLAT( D%NIGLLS(IGP) )
+      END DO
+    
+      DO JF = 1, KFIELDS
+        ZS    = 0.0_JPRD
+        ZTMIN = +HUGE(0.0_JPRB)
+        ZTMAX = -HUGE(0.0_JPRB)
+        DO JI = 1, ICEND
+          ZS = ZS + ZWBLK(JI) * PGP(JI,JF,JBLK)
+          ZTMIN = MIN(ZTMIN, PGP(JI,JF,JBLK))
+          ZTMAX = MAX(ZTMAX, PGP(JI,JF,JBLK))
+        END DO
+        ZSUM(JF)  = ZSUM(JF)  + ZS
+        ZMING(JF) = MIN(ZMING(JF), ZTMIN)
+        ZMAXG(JF) = MAX(ZMAXG(JF), ZTMAX)
+      END DO
+    END DO
+  ENDIF
+
+
+  ! --- SINGLE FINAL REDUCTION TO RANK 1 (BLOCKING, DETERMINISTIC, USING GATHER)
+  IF (NPROC > 1) THEN
+
+    ALLOCATE(ZCOMCNT(NPROC))
+    ZCOMCNT(:)=ILEN
+    ALLOCATE(ZSND(ILEN))
     IF (LDAVE_ONLY) THEN
-      ALLOCATE(ZSND(KFIELDS))
       DO JF = 1, KFIELDS
         ZSND(JF) = ZSUM(JF)
       END DO
     ELSE
-      ALLOCATE(ZSND(3*KFIELDS))
       IND = 0
       DO JF = 1, KFIELDS
         IND = IND + 1; ZSND(IND) = ZSUM(JF)
@@ -636,13 +632,35 @@ IF (NPROC > 1) THEN
         IND = IND + 1; ZSND(IND) = ZMAXG(JF)
       END DO
     END IF
-
-    CALL MPL_SEND(ZSND, KDEST=NPRCIDS(1), KTAG=ITAG, &
-   &              KMP_TYPE=JP_BLOCKING_STANDARD, CDSTRING='GPNORM_TRANS_CTL:FINAL')
-
+  
+    IF (MYPROC == 1) THEN
+      ALLOCATE(ZRCV(ILEN*NPROC))
+    END IF
+  
+    CALL MPL_GATHERV(PSENDBUF=ZSND, PRECVBUF=ZRCV,KRECVCOUNTS=ZCOMCNT,CDSTRING='GPNORM_TRANS_CTL')
+  
+    IF (MYPROC == 1) THEN
+      DO IRANK = 2, NPROC
+        DISP = (IRANK-1)*SIZE(ZSND)
+        IF (LDAVE_ONLY) THEN
+          DO JF = 1, KFIELDS
+            ZSUM(JF) = ZSUM(JF) + ZRCV(DISP + JF)
+          END DO
+        ELSE
+          IND = 0
+          DO JF = 1, KFIELDS
+            IND = IND + 1; ZSUM(JF)  = ZSUM(JF)  + ZRCV(DISP + IND)
+            IND = IND + 1; ZMING(JF) = MIN(ZMING(JF), ZRCV(DISP + IND))
+            IND = IND + 1; ZMAXG(JF) = MAX(ZMAXG(JF), ZRCV(DISP + IND))
+          END DO
+        END IF
+      END DO
+      DEALLOCATE(ZRCV)
+    END IF
+  
     DEALLOCATE(ZSND)
+    DEALLOCATE(ZCOMCNT)
   END IF
-END IF
 
 
   ! --- Final outputs (root or serial case)
@@ -656,7 +674,9 @@ END IF
   DEALLOCATE(ZSUM)
   DEALLOCATE(ZMING)
   DEALLOCATE(ZMAXG)
-  DEALLOCATE(WLAT)
+  DEALLOCATE(ZWLAT)
+  DEALLOCATE(ZWBLK)
+  
 
   IF (LHOOK) CALL DR_HOOK('GPNORM_TRANS_CTL',1,ZHOOK_HANDLE)
 
