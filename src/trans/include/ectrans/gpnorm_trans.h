@@ -9,7 +9,7 @@
 !
 
 INTERFACE
-SUBROUTINE GPNORM_TRANS(PGP,KFIELDS,KPROMA,PAVE,PMIN,PMAX,LDAVE_ONLY,KRESOL)
+SUBROUTINE GPNORM_TRANS(PGP,KFIELDS,KPROMA,PAVE,PMIN,PMAX,LDAVE_ONLY,KRESOL,LREPRO)
 
 
 !**** *GPNORM_TRANS* - calculate grid-point norms
@@ -38,6 +38,7 @@ SUBROUTINE GPNORM_TRANS(PGP,KFIELDS,KPROMA,PAVE,PMIN,PMAX,LDAVE_ONLY,KRESOL)
 !     LDAVE_ONLY  - T : PMIN and PMAX already contain local MIN and MAX
 !     KRESOL      -  resolution tag (optional)
 !                    default assumes first defined resolution
+!     LREPRO      - T full reproducible F reproducible with same subdomain but less communication (optional default T)
 !
 
 !     Author.
@@ -64,6 +65,7 @@ INTEGER(KIND=JPIM),INTENT(IN) :: KFIELDS
 INTEGER(KIND=JPIM),INTENT(IN) :: KPROMA
 LOGICAL,INTENT(IN)            :: LDAVE_ONLY
 INTEGER(KIND=JPIM) ,OPTIONAL, INTENT(IN)  :: KRESOL
+LOGICAL,OPTIONAL,INTENT(IN)   :: LREPRO
 
 END SUBROUTINE GPNORM_TRANS
 END INTERFACE
