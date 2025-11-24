@@ -24,7 +24,7 @@ endif()
 
 set( ntasks 0 )
 if( HAVE_MPI )
-  list( APPEND ntasks 1 2 )
+  list( APPEND ntasks 1 4 7 16 )
 endif()
 
 # --------------------------------------------------------------------------------------------------
