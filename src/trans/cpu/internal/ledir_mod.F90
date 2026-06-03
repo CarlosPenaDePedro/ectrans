@@ -127,7 +127,7 @@ IF (KIFC > 0 .AND. KDGLU > 0 ) THEN
           DO JK=1,KFC,ISKIP
             IFLD=IFLD+1
             DO J=1,KDGLU
-                ZB_D(J,IFLD)=REAL(PAIA(JK,KSL+J-1),JPRD)*PW(KSL+J-1)
+              ZB_D(J,IFLD)=REAL(PAIA(JK,KSL+J-1),JPRD)*PW(KSL+J-1)
             ENDDO
           ENDDO
 
@@ -138,7 +138,7 @@ IF (KIFC > 0 .AND. KDGLU > 0 ) THEN
           DO JK=1,KFC,ISKIP
             IFLD=IFLD+1
             DO J=1,ILA
-                ZCA(J,IFLD) = ZCA_D(J,IFLD)
+              ZCA(J,IFLD) = ZCA_D(J,IFLD)
             ENDDO
           ENDDO
         END BLOCK
